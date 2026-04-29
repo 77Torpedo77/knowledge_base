@@ -1,1 +1,5 @@
 .claude/
+zotero_data/
+*.log
+config.json
+progress.json
