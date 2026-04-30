@@ -456,10 +456,11 @@ def extract_bibtex_title(bibtex_raw: str) -> str:
 # Main Pipeline
 # ---------------------------------------------------------------------------
 
-def collect_entries(cfg: dict, title_map: dict) -> list[dict]:
+def collect_entries(cfg: dict, title_map: dict, item_type_filter: str | None = None) -> list[dict]:
     """获取所有期刊和会议论文条目，匹配 item_key"""
     all_entries = []
-    for item_type in ("journalArticle", "conferencePaper"):
+    types = [item_type_filter] if item_type_filter else ("journalArticle", "conferencePaper")
+    for item_type in types:
         logger.info("获取 %s 条目...", item_type)
         entries = get_all_items_bibtex(cfg, item_type)
         logger.info("  找到 %d 条 %s", len(entries), item_type)
@@ -577,6 +578,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="限制处理条目数 (0=全部)")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
     parser.add_argument("--retry-failed", action="store_true", help="重试之前失败的条目")
+    parser.add_argument("--item-type", choices=["journalArticle", "conferencePaper"], default=None, help="仅处理指定类型（默认全部）")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -611,7 +613,7 @@ def main():
     logger.info("索引 %d 个条目", len(title_map))
 
     # 获取所有条目
-    all_entries = collect_entries(cfg, title_map)
+    all_entries = collect_entries(cfg, title_map, args.item_type)
     logger.info("共 %d 条期刊/会议论文", len(all_entries))
 
     # 解析 PDF
