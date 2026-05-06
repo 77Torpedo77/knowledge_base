@@ -3,3 +3,5 @@ zotero_data/
 *.log
 config.json
 progress.json
+data/
+after_ds_data/
