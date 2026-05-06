@@ -5,3 +5,5 @@ config.json
 progress.json
 data/
 after_ds_data/
+**/__pycache__
+/pipeline_output/

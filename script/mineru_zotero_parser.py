@@ -12,12 +12,14 @@ MinerU Zotero PDF Batch Parser
   4. MinerU 精准解析 API（vlm 模式）批量上传、轮询、下载解压
   5. 断点续传：跳过已存在的输出目录 + progress.json 进度记录
   6. 命令行参数：--dry-run、--limit N、--retry-failed
+  7. --update-metadata：为已解析的条目补全 Zotero 元数据（不重新解析）
 
 使用方式：
   python mineru_zotero_parser.py --dry-run        # 预览
   python mineru_zotero_parser.py --limit 5         # 先解析 5 个
   python mineru_zotero_parser.py                   # 全量运行
   python mineru_zotero_parser.py --retry-failed    # 重试失败项
+  python mineru_zotero_parser.py --update-metadata # 补全元数据
 """
 
 import argparse
@@ -572,6 +574,72 @@ def process_batch(token: str, batch: list[dict], cfg: dict, progress: dict, outp
             logger.error("  失败: %s - %s", cite_key, r.get("err_msg", ""))
 
 
+# ---------------------------------------------------------------------------
+# Metadata Update
+# ---------------------------------------------------------------------------
+
+def fetch_item_metadata(cfg: dict, item_key: str) -> dict | None:
+    """通过 Zotero API 获取条目的完整元数据"""
+    try:
+        resp = zotero_get(f"/items/{item_key}", cfg)
+        return resp.json().get("data")
+    except Exception as e:
+        logger.error("获取元数据失败 [%s]: %s", item_key, e)
+        return None
+
+
+def update_metadata(cfg: dict, output_dir: str, entries: list[dict]):
+    """为已解析的条目目录补全 Zotero 元数据"""
+    cite_to_key = {e["cite_key"]: e.get("item_key") for e in entries if e.get("item_key")}
+
+    # 扫描输出目录
+    dirs = [d for d in os.listdir(output_dir)
+            if os.path.isdir(os.path.join(output_dir, d)) and d != "__pycache__"]
+
+    updated = 0
+    skipped = 0
+    no_key = 0
+
+    for i, cite_key in enumerate(dirs):
+        dest_dir = os.path.join(output_dir, cite_key)
+        meta_file = os.path.join(dest_dir, "metadata.json")
+
+        if os.path.exists(meta_file):
+            skipped += 1
+            continue
+
+        item_key = cite_to_key.get(cite_key)
+        if not item_key:
+            logger.warning("  [%d/%d] 无法映射 item_key: %s", i + 1, len(dirs), cite_key)
+            no_key += 1
+            continue
+
+        logger.info("[%d/%d] 获取元数据: %s", i + 1, len(dirs), cite_key)
+        data = fetch_item_metadata(cfg, item_key)
+        if data is None:
+            continue
+
+        # 只保留有意义的字段
+        keep_fields = [
+            "key", "itemType", "title", "abstractNote", "date", "language",
+            "url", "DOI", "ISSN", "ISBN", "volume", "issue", "pages",
+            "publicationTitle", "journalAbbreviation", "shortTitle",
+            "creators", "tags", "extra", "libraryCatalog",
+            "proceedingsTitle", "conferenceName", "publisher", "place",
+            "series", "edition", "dateAdded", "dateModified",
+        ]
+        metadata = {k: v for k, v in data.items() if k in keep_fields and v}
+        metadata["cite_key"] = cite_key
+
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        updated += 1
+
+    logger.info("=== 元数据更新完成 ===")
+    logger.info("更新: %d | 已存在(跳过): %d | 无法映射: %d | 总目录: %d",
+                updated, skipped, no_key, len(dirs))
+
+
 def main():
     parser = argparse.ArgumentParser(description="MinerU Zotero PDF 批量解析")
     parser.add_argument("--dry-run", action="store_true", help="仅列出条目，不提交解析")
@@ -579,6 +647,7 @@ def main():
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
     parser.add_argument("--retry-failed", action="store_true", help="重试之前失败的条目")
     parser.add_argument("--item-type", choices=["journalArticle", "conferencePaper"], default=None, help="仅处理指定类型（默认全部）")
+    parser.add_argument("--update-metadata", action="store_true", help="为已解析的条目补全 Zotero 元数据")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -616,6 +685,11 @@ def main():
     all_entries = collect_entries(cfg, title_map, args.item_type)
     logger.info("共 %d 条期刊/会议论文", len(all_entries))
 
+    # 元数据更新模式
+    if args.update_metadata:
+        update_metadata(cfg, output_dir, all_entries)
+        return
+
     # 解析 PDF
     pdf_tasks = []
     skipped = 0
@@ -624,9 +698,9 @@ def main():
     for i, entry in enumerate(all_entries):
         cite_key = entry["cite_key"]
 
-        # 检查是否已完成
+        # 检查是否已完成（以 full.md 为标志，避免被 metadata.json 误判）
         dest_dir = os.path.join(output_dir, cite_key)
-        if os.path.isdir(dest_dir) and os.listdir(dest_dir):
+        if os.path.isfile(os.path.join(dest_dir, "full.md")):
             skipped += 1
             continue
 
@@ -639,6 +713,26 @@ def main():
             logger.info("  跳过 (无可用 PDF): %s", cite_key)
             no_pdf += 1
             continue
+
+        # 先抓元数据（几乎必定成功）
+        meta_file = os.path.join(dest_dir, "metadata.json")
+        if not os.path.exists(meta_file) and entry.get("item_key"):
+            os.makedirs(dest_dir, exist_ok=True)
+            data = fetch_item_metadata(cfg, entry["item_key"])
+            if data:
+                keep_fields = [
+                    "key", "itemType", "title", "abstractNote", "date", "language",
+                    "url", "DOI", "ISSN", "ISBN", "volume", "issue", "pages",
+                    "publicationTitle", "journalAbbreviation", "shortTitle",
+                    "creators", "tags", "extra", "libraryCatalog",
+                    "proceedingsTitle", "conferenceName", "publisher", "place",
+                    "series", "edition", "dateAdded", "dateModified",
+                ]
+                metadata = {k: v for k, v in data.items() if k in keep_fields and v}
+                metadata["cite_key"] = cite_key
+                with open(meta_file, "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+                logger.info("  元数据已保存: %s", cite_key)
 
         pdf_tasks.append(pdf_info)
 

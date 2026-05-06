@@ -1,0 +1,67 @@
+🤖 To Code Agent: 基于物理切块与逻辑映射的论文图谱构建系统说明
+
+🎯 架构目标
+
+实现一个高鲁棒性的信息提取管线。上游输入为经过 MinerU 解析的论文 Markdown（可能存在排版错乱、标题丢失等情况）以及从 Zotero
+导出的论文元数据。系统需要通过“Python切块 -> LLM返回ID -> Python按ID拼装与校验”的模式，彻底消除 LLM
+幻觉，并构建高度可扩展的 Neo4j 知识图谱。
+
+模型使用：DeepSeek v4 Flash (1M Context Length)
+
+🛠️ 核心执行管线 (Pipeline Steps)
+
+Phase 1: 物理切块 (Data Preparation)
+
+语言: Python 任务: 将原始 Markdown 转换为带有独立 ID 的积木块。 实现逻辑:
+
+1.  读取原 Markdown 字符串(每篇论文拥有一个md文件，例如某篇的存储在D:\tools\knowledge_base\zotero_data\afifi2021RealTimeExpanded\full.md中)。
+2.  将full.md文本按行切分为数组。
+3.  过滤掉无意义的空块。
+4.  构建并返回一个 JSON/Dict 数组：[{"id": 0, "text": "原文片段1..."}, {"id": 1, "text":"原文片段2..."}]
+
+Phase 2: LLM 语义打标与提取 (LLM Inference)
+
+任务: 将含有 ID 的 JSON 数组传入大模型，要求大模型仅输出 ID 映射表和实体信息。 输入数据: indexed_blocks JSON 数组。
+JSON Schema 强制输出规范 (通过 API 强制json格式输出，可参考D:\tools\knowledge_base\script\deepseek_paper_summary.py):
+
+{
+  "section_mapping": {
+    "BACKGROUND":[0, 1, 2, 5],
+    "RELATED_WORK": [6, 7, 8],
+    "METHOD":[10, 11, 12, 15],
+    "EXPERIMENT":[16, 17, 18, 20],
+    "CONCLUSION": [25, 26],
+    "TRASH": [3, 4, 9, 13, 14, 19] // 必须包含 TRASH 类别，让模型把解析错乱的表格、乱码、无意义页眉 ID 放入此处
+  },
+  "extracted_entities":[
+    {
+      "entity_type": "DATASET", // 枚举值: PROBLEM, METHOD, DATASET, BASELINE_METHOD
+      "entity_name": "CIFAR-10",
+      "evidence_block_id": 18, // 必须指出证据存在于哪个文本块
+      "evidence_quote": "We evaluate our model on CIFAR-10..." // 原文的精准子串
+    }
+  ]
+}
+
+Phase 3: 零幻觉拼装与模糊校验 (Post-processing & Verification)
+
+语言: Python 任务: 根据 LLM 输出的 JSON，结合原始的 indexed_blocks 进行真实数据的拼装。 实现逻辑:
+
+1.  组装 Section 内容: 遍历 section_mapping（忽略 TRASH），根据 ID 数组，将对应的 text拼接成完整的纯净 Markdown 字符串。
+2.  校验 Evidence Quote (防幻觉拦截器):
+      - 读取实体中的 evidence_block_id，定位到原始的
+        indexed_blocks[evidence_block_id]["text"]。
+      - Exact Match: 检查 evidence_quote 是否直接 in 原始 text。
+      - Fuzzy Match: 如果 Exact Match 失败，使用 thefuzz
+        等库计算相似度。如果最高相似度大于 85%，用原文中匹配到的句子替换
+        LLM 给出的 quote；如果小于 85%，判定为幻觉，将该条实体记录丢弃 (Drop)并警告。
+
+⚠️ 给 Agent 的特别代码编写约束
+
+1.  不要在 Phase 1 尝试使用正则表达式解析 Markdown 标题(#)，完全依靠物理换行符切块。
+2.  在 Phase 2 中，设计 DeepSeek 的 System Prompt 时，必须严厉警告模型：“不要修改任何原文内容，只输出数字 ID；提取
+    quote 时必须是 Direct Copy-Paste”。
+3.  在 Phase 3 的模糊匹配逻辑中，务必将目标 block 按句号切分成句子（Sentences）后再计算相似度，不要拿整段 block 去和
+    quote 算相似度。
+4.  整个流程应设计为面向对象的 Pipeline（如 PaperProcessor 类），暴露出
+    process_single_paper(pdf_md_path, zotero_meta) 接口，方便后续异步并发处理 500 篇论文。
