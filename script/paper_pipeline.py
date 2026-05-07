@@ -95,9 +95,14 @@ def llm_extract(client: OpenAI, indexed_blocks: list[dict],
             model=model,
             messages=messages,
             response_format={"type": "json_object"},
-            max_tokens=8192,
+            max_tokens=32768,
         )
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
+        log.info("LLM usage: prompt=%s, completion=%s, finish_reason=%s",
+                 response.usage.prompt_tokens if response.usage else "?",
+                 response.usage.completion_tokens if response.usage else "?",
+                 choice.finish_reason)
         if not content or not content.strip():
             log.warning("LLM returned empty response")
             return None
@@ -264,16 +269,9 @@ class PaperProcessor:
             "entities": assembled["entities"],
             "trash_ids": assembled["trash_ids"],
             "block_count": len(indexed_blocks),
-            "meta": {
-                "title": zotero_meta.get("title", ""),
-                "year": (zotero_meta.get("date") or "")[:4],
-                "journal": zotero_meta.get("publicationTitle", ""),
-                "doi": zotero_meta.get("DOI", ""),
-                "authors": [
-                    f"{c.get('firstName', '')} {c.get('lastName', '')}".strip()
-                    for c in zotero_meta.get("creators", [])
-                ],
-            },
+            "llm_raw": llm_result,
+            "meta": {k: v for k, v in zotero_meta.items()
+                     if k not in ("tags", "dateAdded", "dateModified")},
         }
 
 
@@ -284,7 +282,7 @@ def find_paper_dirs(data_dir: Path, limit: int | None = None) -> list[Path]:
     """扫描所有包含 full.md 的论文目录。"""
     dirs = sorted(
         d for d in data_dir.iterdir()
-        if d.is_dir() and (d / "full.md").exists()
+        if d.is_dir() and (d / "full_clear_table.md").exists()
     )
     if limit is not None:
         dirs = dirs[:limit]
@@ -301,9 +299,16 @@ def load_metadata(paper_dir: Path) -> dict | None:
 
 
 def save_result(result: dict, output_dir: Path):
-    """保存处理结果为 JSON 文件。"""
+    """保存处理结果和 LLM 原始输出为 JSON 文件。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     cite_key = result.get("cite_key", "unknown")
+
+    # LLM 原始输出单独保存，方便 debug
+    llm_raw = result.pop("llm_raw", None)
+    if llm_raw is not None:
+        raw_file = output_dir / f"{cite_key}_llm_raw.json"
+        raw_file.write_text(json.dumps(llm_raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
     out_file = output_dir / f"{cite_key}.json"
     out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -344,7 +349,7 @@ def main():
         log.info("[%d/%d] Processing: %s", i, len(paper_dirs), cite_key)
 
         meta = load_metadata(paper_dir) or {"cite_key": cite_key}
-        md_path = paper_dir / "full.md"
+        md_path = paper_dir / "full_clear_table.md"
 
         try:
             result = processor.process_single_paper(md_path, meta)
