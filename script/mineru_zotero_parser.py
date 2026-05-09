@@ -440,7 +440,7 @@ def normalize_title(title: str) -> str:
 def build_title_to_key_map(cfg: dict) -> dict:
     """构建 {normalized_title: item_key} 映射（从 JSON API）"""
     title_map = {}
-    for item_type in ("journalArticle", "conferencePaper"):
+    for item_type in ("journalArticle", "conferencePaper", "preprint"):
         items = get_items_json(cfg, item_type)
         for item in items:
             nt = normalize_title(item["title"])
@@ -461,7 +461,7 @@ def extract_bibtex_title(bibtex_raw: str) -> str:
 def collect_entries(cfg: dict, title_map: dict, item_type_filter: str | None = None) -> list[dict]:
     """获取所有期刊和会议论文条目，匹配 item_key"""
     all_entries = []
-    types = [item_type_filter] if item_type_filter else ("journalArticle", "conferencePaper")
+    types = [item_type_filter] if item_type_filter else ("journalArticle", "conferencePaper", "preprint")
     for item_type in types:
         logger.info("获取 %s 条目...", item_type)
         entries = get_all_items_bibtex(cfg, item_type)
@@ -646,7 +646,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="限制处理条目数 (0=全部)")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
     parser.add_argument("--retry-failed", action="store_true", help="重试之前失败的条目")
-    parser.add_argument("--item-type", choices=["journalArticle", "conferencePaper"], default=None, help="仅处理指定类型（默认全部）")
+    parser.add_argument("--item-type", choices=["journalArticle", "conferencePaper", "preprint"], default=None, help="仅处理指定类型（默认全部）")
     parser.add_argument("--update-metadata", action="store_true", help="为已解析的条目补全 Zotero 元数据")
     args = parser.parse_args()
 
