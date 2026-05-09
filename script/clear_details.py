@@ -1,11 +1,10 @@
 """
-清理 full.md 中的 HTML 表格，将每个表格提取到 table/ 目录下的独立 .md 文件中，
-生成 full_clear_table.md（不修改原始 full.md）。
+清理 Markdown 中的 <details>...</details> 折叠块，生成 full_clear.md（不修改原始 full.md）。
 
 用法:
-  python clear_table.py                          # 处理所有包含表格的 full.md
-  python clear_table.py --single campos2021...   # 只处理指定目录
-  python clear_table.py --dry-run                # 预览不写入
+  python clear_details.py                          # 处理所有包含 details 的 full.md
+  python clear_details.py --single yu2025MCVO...   # 只处理指定目录
+  python clear_details.py --dry-run                # 预览不写入
 """
 
 import argparse
@@ -13,45 +12,37 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pipeline.clear_table import extract_tables
+from pipeline.clear_details import remove_details
 
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_DATA_DIR = SCRIPT_DIR.parent / "zotero_data"
 
 
 def process_paper(paper_dir: Path, dry_run: bool = False) -> bool:
-    """处理单个论文目录。返回是否处理了表格。"""
+    """处理单个论文目录。返回是否处理了 details。"""
     full_md = paper_dir / "full.md"
     if not full_md.exists():
         return False
 
     md_text = full_md.read_text(encoding="utf-8")
-    if "<table>" not in md_text:
+    if "<details>" not in md_text:
         return False
 
     cite_key = paper_dir.name
-    clear_path = paper_dir / "full_clear_table.md"
+    clear_path = paper_dir / "full_clear.md"
+    cleared_text, count = remove_details(md_text)
 
     if dry_run:
-        # dry-run 时只统计，不写文件
-        pattern = __import__("re").compile(r"<table>.*?</table>", __import__("re").DOTALL)
-        count = len(pattern.findall(md_text))
-        if count:
-            print(f"  [{cite_key}] {count} tables found (dry-run)")
+        print(f"  [{cite_key}] {count} details blocks found (dry-run)")
         return count > 0
 
-    cleared_text, count = extract_tables(md_text, paper_dir)
-
-    if count == 0:
-        return False
-
     clear_path.write_text(cleared_text, encoding="utf-8")
-    print(f"  [{cite_key}] {count} tables extracted -> full_clear_table.md")
+    print(f"  [{cite_key}] {count} details blocks removed -> full_clear.md")
     return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="清理 full.md 中的 HTML 表格")
+    parser = argparse.ArgumentParser(description="清理 Markdown 中的 details 折叠块")
     parser.add_argument("--data-dir", type=str, default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--single", type=str, default=None, help="只处理指定 cite_key 目录")
     parser.add_argument("--dry-run", action="store_true", help="预览不写入")
@@ -71,7 +62,7 @@ def main():
         if process_paper(paper_dir, dry_run=args.dry_run):
             processed += 1
 
-    print(f"\nDone. {processed}/{total} papers had tables extracted.")
+    print(f"\nDone. {processed}/{total} papers had details removed.")
 
 
 if __name__ == "__main__":

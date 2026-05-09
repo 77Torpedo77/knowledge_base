@@ -2,6 +2,7 @@
 
 import json
 import logging
+import sys
 
 from openai import OpenAI
 
@@ -153,20 +154,72 @@ def llm_extract(client: OpenAI, indexed_blocks: list[dict],
     ]
 
     try:
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=model,
             messages=messages,
             response_format={"type": "json_object"},
             max_tokens=32768,
             reasoning_effort="max",
             extra_body={"thinking": {"type": "enabled"}},
+            stream=True,
         )
-        choice = response.choices[0]
-        content = choice.message.content
-        log.info("LLM usage: prompt=%s, completion=%s, finish_reason=%s",
-                 response.usage.prompt_tokens if response.usage else "?",
-                 response.usage.completion_tokens if response.usage else "?",
-                 choice.finish_reason)
+
+        content_parts = []
+        reasoning_parts = []
+        last_phase = None
+        usage = None
+        reasoning_chars = 0
+        output_chars = 0
+        next_reasoning_report = 1000
+        next_output_report = 1000
+
+        for chunk in stream:
+            # 提取 usage（最后一个 chunk 携带）
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = chunk.usage
+
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is None:
+                continue
+
+            # 思考阶段 — 仅收集用于日志，不参与 JSON 解析
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                if last_phase != "thinking":
+                    sys.stdout.write("LLM thinking: 0 chars")
+                    sys.stdout.flush()
+                    last_phase = "thinking"
+                reasoning_parts.append(delta.reasoning_content)
+                reasoning_chars += len(delta.reasoning_content)
+                if reasoning_chars >= next_reasoning_report:
+                    sys.stdout.write(f"\rLLM thinking: {reasoning_chars} chars")
+                    sys.stdout.flush()
+                    next_reasoning_report += 1000
+            # 输出阶段 — 收集实际 JSON 内容
+            elif delta.content:
+                if last_phase != "output":
+                    sys.stdout.write(f"\rLLM thinking: {reasoning_chars} chars\n")
+                    sys.stdout.write("LLM generating JSON: 0 chars")
+                    sys.stdout.flush()
+                    last_phase = "output"
+                content_parts.append(delta.content)
+                output_chars += len(delta.content)
+                if output_chars >= next_output_report:
+                    sys.stdout.write(f"\rLLM generating JSON: {output_chars} chars")
+                    sys.stdout.flush()
+                    next_output_report += 1000
+
+        content = "".join(content_parts)
+        reasoning_len = sum(len(s) for s in reasoning_parts)
+        if last_phase == "thinking":
+            sys.stdout.write(f"\rLLM thinking: {reasoning_len} chars\n")
+        elif last_phase == "output":
+            sys.stdout.write(f"\rLLM generating JSON: {len(content)} chars\n")
+        sys.stdout.flush()
+        log.info("LLM usage: prompt=%s, completion=%s, reasoning=%d chars, output=%d chars, finish_reason=%s",
+                 usage.prompt_tokens if usage else "?",
+                 usage.completion_tokens if usage else "?",
+                 reasoning_len, len(content),
+                 chunk.choices[0].finish_reason if chunk.choices else "?")
         if not content or not content.strip():
             log.warning("LLM returned empty response")
             return None

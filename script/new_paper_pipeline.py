@@ -1,11 +1,14 @@
 """
 模块化论文图谱构建管线
-Pipeline: Markdown → 物理切块 → LLM语义提取 → 零幻觉校验 → 拼装
+Pipeline: Markdown → 表格/details清理 → 物理切块 → LLM语义提取 → 零幻觉校验 → 拼装
 
 用法:
   python new_paper_pipeline.py                          # 处理所有论文
   python new_paper_pipeline.py --limit 5                # 限制数量
   python new_paper_pipeline.py --single pan2025xxx      # 处理指定论文
+
+前置要求: zotero_data/{cite_key}/full.md 需已存在（由 mineru_zotero_parser.py 生成）。
+管线会自动执行预处理（full.md → full_clear.md）。
 """
 
 import argparse
@@ -20,9 +23,11 @@ from pipeline.chunker import chunk_markdown
 from pipeline.extractor import llm_extract
 from pipeline.verifier import verify_entities
 from pipeline.assembler import assemble, check_coverage
+from pipeline.clear_table import clear_tables_for_paper
+from pipeline.clear_details import clear_details_for_paper
 from pipeline.utils import (
     load_config, find_paper_dirs, load_metadata, save_result,
-    CONFIG_PATH, DATA_DIR, OUTPUT_DIR,
+    CONFIG_PATH, DATA_DIR,
 )
 
 logging.basicConfig(
@@ -43,18 +48,30 @@ class PaperProcessor:
             raise ValueError("'llm_key' not found in config.json")
         self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
-    def process_single_paper(self, md_path: Path, zotero_meta: dict) -> tuple[dict, dict | None]:
+    def process_single_paper(self, paper_dir: Path, zotero_meta: dict) -> tuple[dict, dict | None]:
         """
         处理单篇论文的完整管线。
+
+        Args:
+            paper_dir: 论文目录（包含 full.md / full_clear.md / metadata.json）
+            zotero_meta: Zotero 元数据
 
         Returns:
             (最终结果dict, LLM原始输出dict)
         """
+        cite_key = zotero_meta.get("cite_key", paper_dir.name)
+
+        # Phase 0: 预处理（full.md → full_clear_table.md → full_clear.md）
+        clear_tables_for_paper(paper_dir, source_name="full.md", target_name="full_clear_table.md")
+        clear_details_for_paper(paper_dir, source_name="full_clear_table.md", target_name="full_clear.md")
+
+        md_path = paper_dir / "full_clear.md"
         if not md_path.exists():
-            raise FileNotFoundError(f"Markdown file not found: {md_path}")
+            log.error("[%s] full_clear.md not found after preprocessing", cite_key)
+            return {"paper_id": cite_key, "metadata": {}, "sections": [],
+                    "extracted_entities": {}, "error": "no_full_clear"}, None
 
         text = md_path.read_text(encoding="utf-8")
-        cite_key = zotero_meta.get("cite_key", md_path.parent.name)
         log.info("[%s] Starting pipeline — MD size: %d chars", cite_key, len(text))
 
         # Phase 1: 物理切块
@@ -68,7 +85,7 @@ class PaperProcessor:
             return result, None
 
         # 保存送入 LLM 前的对照文件（每行对应一个 block ID）
-        before_llm_path = md_path.parent / "full_before_llm.md"
+        before_llm_path = paper_dir / "full_before_llm.md"
         before_llm_path.write_text(
             "\n".join(b["text"] for b in indexed_blocks),
             encoding="utf-8",
@@ -117,21 +134,22 @@ class PaperProcessor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="New Paper Pipeline: Chunk → LLM → Verify → Assemble")
+    parser = argparse.ArgumentParser(description="Paper Pipeline: Preprocess → Chunk → LLM → Verify → Assemble")
     parser.add_argument("--limit", type=int, default=None, help="限制处理论文数量")
     parser.add_argument("--delay", type=float, default=1.0, help="API 调用间隔（秒）")
     parser.add_argument("--data-dir", type=str, default=str(DATA_DIR), help="论文数据目录")
-    parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR), help="输出目录")
     parser.add_argument("--single", type=str, default=None, help="只处理指定 cite_key 的论文")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    output_dir = Path(args.output_dir)
     processor = PaperProcessor()
 
     if args.single:
         target = data_dir / args.single
-        paper_dirs = [target] if target.exists() else []
+        if not target.exists() or not (target / "full.md").exists():
+            log.error("Paper not found: %s (need full.md)", target)
+            return
+        paper_dirs = [target]
     else:
         paper_dirs = find_paper_dirs(data_dir, args.limit)
 
@@ -148,11 +166,10 @@ def main():
         log.info("[%d/%d] Processing: %s", i, len(paper_dirs), cite_key)
 
         meta = load_metadata(paper_dir) or {"cite_key": cite_key}
-        md_path = paper_dir / "full_clear_table.md"
 
         try:
-            result, llm_raw = processor.process_single_paper(md_path, meta)
-            save_result(result, llm_raw, output_dir)
+            result, llm_raw = processor.process_single_paper(paper_dir, meta)
+            save_result(result, llm_raw, paper_dir)
             if "error" not in result:
                 success += 1
         except Exception as e:
@@ -162,8 +179,8 @@ def main():
             time.sleep(args.delay)
 
     log.info("=" * 60)
-    log.info("Done. %d/%d papers processed successfully. Results in %s",
-             success, len(paper_dirs), output_dir)
+    log.info("Done. %d/%d papers processed successfully. Results saved in paper directories under %s",
+             success, len(paper_dirs), data_dir)
 
 
 if __name__ == "__main__":
