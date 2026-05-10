@@ -13,13 +13,15 @@ MinerU Zotero PDF Batch Parser
   5. 断点续传：跳过已存在的输出目录 + progress.json 进度记录
   6. 命令行参数：--dry-run、--limit N、--retry-failed
   7. --update-metadata：为已解析的条目补全 Zotero 元数据（不重新解析）
+  8. --force：与 --update-metadata 搭配，覆盖已存在的 metadata.json
 
 使用方式：
-  python mineru_zotero_parser.py --dry-run        # 预览
-  python mineru_zotero_parser.py --limit 5         # 先解析 5 个
-  python mineru_zotero_parser.py                   # 全量运行
-  python mineru_zotero_parser.py --retry-failed    # 重试失败项
-  python mineru_zotero_parser.py --update-metadata # 补全元数据
+  python mineru_zotero_parser.py --dry-run                     # 预览
+  python mineru_zotero_parser.py --limit 5                     # 先解析 5 个
+  python mineru_zotero_parser.py                               # 全量运行
+  python mineru_zotero_parser.py --retry-failed                # 重试失败项
+  python mineru_zotero_parser.py --update-metadata             # 补全缺失元数据
+  python mineru_zotero_parser.py --update-metadata --force     # 强制重写所有 metadata.json
 """
 
 import argparse
@@ -149,7 +151,7 @@ def get_item_children(cfg: dict, item_key: str) -> list[dict]:
 
 
 def get_items_json(cfg: dict, item_type: str) -> list[dict]:
-    """获取指定类型的所有条目（JSON 格式），用于 fallback 获取 item_key"""
+    """获取指定类型的所有条目（JSON 格式），用于拿到 item_key 与 citationKey。"""
     results = []
     start = 0
     limit = 100
@@ -169,6 +171,7 @@ def get_items_json(cfg: dict, item_type: str) -> list[dict]:
                 "key": d.get("key"),
                 "title": d.get("title", ""),
                 "itemType": d.get("itemType", ""),
+                "citationKey": d.get("citationKey", ""),
             })
         if len(items) < limit:
             break
@@ -428,38 +431,28 @@ def save_progress(output_dir: str, progress: dict):
 
 
 # ---------------------------------------------------------------------------
-# Title matching (JSON -> BibTeX)
+# cite_key -> item_key matching
 # ---------------------------------------------------------------------------
 
-def normalize_title(title: str) -> str:
-    """标准化标题用于匹配：去除 LaTeX 花括号，小写，去空格"""
-    t = re.sub(r"[{}\\]", "", title)
-    return re.sub(r"\s+", " ", t).strip().lower()
-
-
-def build_title_to_key_map(cfg: dict) -> dict:
-    """构建 {normalized_title: item_key} 映射（从 JSON API）"""
-    title_map = {}
+def build_cite_key_to_item_key_map(cfg: dict) -> dict:
+    """构建 {citationKey: item_key} 映射（从 JSON API）。"""
+    cite_key_map = {}
     for item_type in ("journalArticle", "conferencePaper", "preprint"):
         items = get_items_json(cfg, item_type)
         for item in items:
-            nt = normalize_title(item["title"])
-            title_map[nt] = item["key"]
-    return title_map
-
-
-def extract_bibtex_title(bibtex_raw: str) -> str:
-    """从 BibTeX 条目中提取标题"""
-    m = re.search(r"title\s*=\s*\{(.+?)\}", bibtex_raw)
-    return m.group(1) if m else ""
+            citation_key = (item.get("citationKey") or "").strip()
+            item_key = item.get("key")
+            if citation_key and item_key:
+                cite_key_map[citation_key] = item_key
+    return cite_key_map
 
 
 # ---------------------------------------------------------------------------
 # Main Pipeline
 # ---------------------------------------------------------------------------
 
-def collect_entries(cfg: dict, title_map: dict, item_type_filter: str | None = None) -> list[dict]:
-    """获取所有期刊和会议论文条目，匹配 item_key"""
+def collect_entries(cfg: dict, cite_key_map: dict, item_type_filter: str | None = None) -> list[dict]:
+    """获取所有期刊和会议论文条目，并按 cite_key 直接匹配 item_key。"""
     all_entries = []
     types = [item_type_filter] if item_type_filter else ("journalArticle", "conferencePaper", "preprint")
     for item_type in types:
@@ -468,16 +461,7 @@ def collect_entries(cfg: dict, title_map: dict, item_type_filter: str | None = N
         logger.info("  找到 %d 条 %s", len(entries), item_type)
 
         for entry in entries:
-            bib_title = extract_bibtex_title(entry["bibtex_raw"])
-            nt = normalize_title(bib_title)
-            item_key = title_map.get(nt)
-            if not item_key:
-                # 尝试部分匹配
-                for map_title, map_key in title_map.items():
-                    if nt in map_title or map_title in nt:
-                        item_key = map_key
-                        break
-            entry["item_key"] = item_key
+            entry["item_key"] = cite_key_map.get(entry["cite_key"])
             all_entries.append(entry)
 
     return all_entries
@@ -588,8 +572,8 @@ def fetch_item_metadata(cfg: dict, item_key: str) -> dict | None:
         return None
 
 
-def update_metadata(cfg: dict, output_dir: str, entries: list[dict]):
-    """为已解析的条目目录补全 Zotero 元数据"""
+def update_metadata(cfg: dict, output_dir: str, entries: list[dict], force: bool = False):
+    """为已解析的条目目录补全或重写 Zotero 元数据。"""
     cite_to_key = {e["cite_key"]: e.get("item_key") for e in entries if e.get("item_key")}
 
     # 扫描输出目录
@@ -604,9 +588,15 @@ def update_metadata(cfg: dict, output_dir: str, entries: list[dict]):
         dest_dir = os.path.join(output_dir, cite_key)
         meta_file = os.path.join(dest_dir, "metadata.json")
 
-        if os.path.exists(meta_file):
+        if os.path.exists(meta_file) and not force:
             skipped += 1
             continue
+
+        if os.path.exists(meta_file) and force:
+            logger.info("[%d/%d] 覆盖元数据: %s", i + 1, len(dirs), cite_key)
+        else:
+            logger.info("[%d/%d] 获取元数据: %s", i + 1, len(dirs), cite_key)
+
 
         item_key = cite_to_key.get(cite_key)
         if not item_key:
@@ -614,7 +604,6 @@ def update_metadata(cfg: dict, output_dir: str, entries: list[dict]):
             no_key += 1
             continue
 
-        logger.info("[%d/%d] 获取元数据: %s", i + 1, len(dirs), cite_key)
         data = fetch_item_metadata(cfg, item_key)
         if data is None:
             continue
@@ -636,8 +625,12 @@ def update_metadata(cfg: dict, output_dir: str, entries: list[dict]):
         updated += 1
 
     logger.info("=== 元数据更新完成 ===")
-    logger.info("更新: %d | 已存在(跳过): %d | 无法映射: %d | 总目录: %d",
-                updated, skipped, no_key, len(dirs))
+    if force:
+        logger.info("更新: %d | 无法映射: %d | 总目录: %d | 模式: force overwrite",
+                    updated, no_key, len(dirs))
+    else:
+        logger.info("更新: %d | 已存在(跳过): %d | 无法映射: %d | 总目录: %d",
+                    updated, skipped, no_key, len(dirs))
 
 
 def main():
@@ -648,6 +641,7 @@ def main():
     parser.add_argument("--retry-failed", action="store_true", help="重试之前失败的条目")
     parser.add_argument("--item-type", choices=["journalArticle", "conferencePaper", "preprint"], default=None, help="仅处理指定类型（默认全部）")
     parser.add_argument("--update-metadata", action="store_true", help="为已解析的条目补全 Zotero 元数据")
+    parser.add_argument("--force", action="store_true", help="与 --update-metadata 搭配，覆盖已存在的 metadata.json")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -676,18 +670,22 @@ def main():
         logger.error("Zotero 本地 API 不可达: %s (请确认 Zotero 正在运行)", e)
         sys.exit(1)
 
-    # 构建标题映射
-    logger.info("构建标题索引...")
-    title_map = build_title_to_key_map(cfg)
-    logger.info("索引 %d 个条目", len(title_map))
+    # 构建 cite_key 到 item_key 的稳定映射
+    logger.info("构建 cite_key -> item_key 映射...")
+    cite_key_map = build_cite_key_to_item_key_map(cfg)
+    logger.info("索引 %d 个 cite_key -> item_key 映射", len(cite_key_map))
 
     # 获取所有条目
-    all_entries = collect_entries(cfg, title_map, args.item_type)
+    all_entries = collect_entries(cfg, cite_key_map, args.item_type)
     logger.info("共 %d 条期刊/会议论文", len(all_entries))
+
+    if args.force and not args.update_metadata:
+        logger.error("--force 只能与 --update-metadata 一起使用")
+        sys.exit(2)
 
     # 元数据更新模式
     if args.update_metadata:
-        update_metadata(cfg, output_dir, all_entries)
+        update_metadata(cfg, output_dir, all_entries, force=args.force)
         return
 
     # 解析 PDF
