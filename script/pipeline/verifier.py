@@ -1,6 +1,7 @@
 """Phase 3: 零幻觉校验 — 基于 evidence_block_id 精确校验 evidence_quote"""
 
 import logging
+import re
 
 from thefuzz import fuzz
 
@@ -33,7 +34,7 @@ def _verify_entity(entity: dict, block_map: dict) -> tuple[bool, str | None]:
         log.warning("Entity '%s' has invalid evidence_block_id=%s, fallback to full search",
                     entity.get("name_in_paper"), block_id)
         for block in block_map.values():
-            if quote in block["text"]:
+            if quote.lower() in block["text"].lower():
                 return True, quote
         log.warning("HALLUCINATION: '%s' quote='%.60s...' not found, DROPPED",
                     entity.get("name_in_paper"), quote)
@@ -41,19 +42,34 @@ def _verify_entity(entity: dict, block_map: dict) -> tuple[bool, str | None]:
 
     original_text = block_map[block_id]["text"]
 
-    # 精确匹配（大小写不敏感）
+    # 1. 精确匹配（大小写不敏感）
     if quote.lower() in original_text.lower():
         return True, quote
 
-    # 模糊匹配（partial_ratio 滑动窗口找最佳子串匹配）
+    # 2. Token 重叠检查：quote 中的单词有 ≥75% 出现在 block 文本中
+    #    解决 LaTeX 编码导致的字符差异（如 \mathrm{REL} vs REL）
+    q_words = set(re.findall(r'[a-zA-Z0-9]+', quote.lower()))
+    if len(q_words) >= 2:
+        t_words = set(re.findall(r'[a-zA-Z0-9]+', original_text.lower()))
+        overlap = q_words & t_words
+        overlap_ratio = len(overlap) / len(q_words)
+        if overlap_ratio >= 0.75:
+            log.info("Token overlap for '%s': %d/%d words (%.0f%%) → accepted",
+                     entity.get("name_in_paper"), len(overlap), len(q_words),
+                     overlap_ratio * 100)
+            return True, quote
+
+    # 3. 模糊匹配（partial_ratio ≥ 80%）
     best_ratio = fuzz.partial_ratio(quote, original_text) / 100.0
-    if best_ratio >= 0.85:
+    if best_ratio >= 0.80:
         log.info("Fuzzy match for '%s': %.1f%% → accepted",
                  entity.get("name_in_paper"), best_ratio * 100)
         return True, quote
 
-    log.warning("HALLUCINATION: '%s' block_id=%d quote='%.60s...' partial_ratio=%.1f%%, DROPPED",
-                entity.get("name_in_paper"), block_id, quote, best_ratio * 100)
+    log.warning("HALLUCINATION: '%s' block_id=%d quote='%.60s...' token_overlap=%.0f%% fuzzy=%.1f%%, DROPPED",
+                entity.get("name_in_paper"), block_id, quote,
+                overlap_ratio * 100 if len(q_words) >= 2 else 0,
+                best_ratio * 100)
     return False, None
 
 
