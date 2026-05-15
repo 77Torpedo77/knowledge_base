@@ -91,6 +91,7 @@ Categories:
 
    d) "evaluation_metrics": Specific QUANTITATIVE metrics used to mathematically measure success.
       CRITICAL: Extract terms like "Absolute Trajectory Error", "Top-1 Accuracy", or "Runtime". Do NOT extract qualitative, subjective goals or abstract properties (e.g., "robustness", "efficiency", "performance").
+	      Do NOT use threshold expressions or mathematical notation as metric names (e.g., "delta < 1.25", "delta1", "delta3"). Instead, use the full descriptive name that disambiguates the metric (e.g., "Depth accuracy at threshold 1.25", "Percentage of inliers with relative error below 1.25").
 
    e) "baselines": External prior works, peer-reviewed methods, or existing architectures used as a comparison standard.
       CRITICAL: You MUST strictly distinguish external baselines from internal ablation studies. Do NOT extract the authors' own degraded variants or ablation models (e.g., "Ours w/o module A", "proposed method (baseline)") as baselines.

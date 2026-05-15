@@ -1,7 +1,7 @@
 # 论文知识库工作手册
 
 > 本文档旨在让一个无上下文的 Agent 从零理解和操作论文知识库的全部流程。
-> 最后更新：2026-05-11
+> 最后更新：2026-05-15
 
 ---
 
@@ -328,7 +328,7 @@ python neo4j_bronze_ingestor.py \
 4. 重建新 Section 和新关系
 5. 清理因失去所有关系而变成孤立的 Mention 节点
 
-### 6.5 当前图谱统计（2026-05-11 全量导入后）
+### 6.5 当前图谱统计（2026-05-14 删库重建后）
 
 | 指标 | 数量 |
 |------|------|
@@ -458,3 +458,206 @@ driver.close()
 ### 优先级 3
 - Silver Layer：跨论文实体归一化
 - 别名聚合、语义聚类、统一实体节点
+
+---
+
+## 11. Silver/Gold Layer 构建（2026-05-12）
+
+### 11.1 三层架构总览
+
+```
+Bronze Layer（铜层）  → 论文原始 Mention（已完成）
+    ↓ silver_builder.py（确定性规则归并）
+Silver Layer（银层）  → SAME_AS 关系连接等价 Mention
+    ↓ bronze_export.py + gold_ontology_builder.py + gold_importer.py
+Gold Layer（金层）  → CanonicalEntity + IS_A 层级本体
+```
+
+### 11.2 Silver Layer
+
+**脚本**：`script/silver_builder.py`
+
+**规则**：
+- Rule 1：大小写/标点/空格归一化后完全相同 → 合并
+- Rule 2：别名交叉匹配（过滤泛称别名和长度 < 3 的别名） → 合并
+
+**归并结果**：
+
+| Label | 原始 | 归并后 | 减少量 | SAME_AS 关系 |
+|-------|------|--------|--------|-------------|
+| TaskMention | 174 | 172 | 2 | 2 |
+| MethodMention | 431 | 424 | 7 | 10 |
+| DatasetMention | 309 | 235 | 74 | 106 |
+| MetricMention | 342 | 252 | 90 | 126 |
+| BaselineMention | 408 | 354 | 54 | 90 |
+| FlawMention | 340 | 337 | 3 | 6 |
+| LimitationMention | 205 | 203 | 2 | 2 |
+
+**操作命令**：
+```bash
+# 预览
+python silver_builder.py --dry-run
+
+# 执行 + 导出
+python silver_builder.py --export D:/tools/knowledge_base/silver_data.json
+```
+
+### 11.3 Gold Layer
+
+#### 11.3.1 导出
+
+**脚本**：`script/bronze_export.py`
+
+将 Silver 归并后的 Mention 按 SAME_AS 连通分量分组，每组取一个代表，输出为 LLM 友好的 JSON。
+
+```bash
+python bronze_export.py --output silver_input.json
+```
+
+产出：`silver_input.json`（约 134k tokens），按 7 个类别分别组织。
+
+#### 11.3.2 LLM 本体推演
+
+**脚本**：`script/gold_ontology_builder.py`
+
+- 模型：DeepSeek v4 Flash（1M 上下文）
+- 每批最多 120 个实体（避免输出截断和连接超时）
+- 自动分批、重试（2 次）
+- 校验完整性（所有 mention_id 必须出现在输出中）
+- 同时输出可读的树状文本（`*_tree.txt`）
+
+```bash
+# 全量构建
+python gold_ontology_builder.py
+
+# 只处理某类
+python gold_ontology_builder.py --label BaselineMention
+```
+
+**LLM 构建结果**：
+
+| 类别 | 实体数 | Canonical 节点 | 校验 |
+|------|--------|---------------|------|
+| TaskMention | 172 | 219 | ✓ |
+| MethodMention | 424 | 475 | ✓ |
+| DatasetMention | 235 | 245 | ✓ |
+| MetricMention | 252 | 100 | ✗ 部分缺失 |
+| BaselineMention | 354 | 429 | ✓ |
+| FlawMention | 337 | 346 | ✗ 1 个丢失 |
+| LimitationMention | 203 | 131 | ✓ |
+
+输出目录：`D:\tools\knowledge_base\gold_output\`
+- `{Label}_ontology.json`：LLM 输出的本体 JSON（待人工审查）
+- `{Label}_tree.txt`：可读的缩进树状视图
+
+**人工审查**：审查上述 JSON 文件，修正 LLM 的错误归并或层级后，再执行导入。
+
+#### 11.3.3 导入 Neo4j
+
+**脚本**：`script/gold_importer.py`
+
+解析本体 JSON，创建：
+- `Canonical{Type}` 节点（`canonical_id`, `canonical_name`, `canonical_type`, `mention_count`）
+- `(CanonicalEntity)-[:IS_A]->(CanonicalEntity)` 父子关系
+- `(Mention)-[:RESOLVES_TO]->(CanonicalEntity)` 映射关系
+
+```bash
+# 预览
+python gold_importer.py --dry-run
+
+# 执行导入
+python gold_importer.py
+
+# 只导入某类
+python gold_importer.py --label BaselineMention
+```
+
+### 11.4 Gold Layer Neo4j Schema 扩展
+
+#### 新增节点类型
+
+| Label | 主键 | 属性 |
+|-------|------|------|
+| `CanonicalTask` | `canonical_id` | canonical_id, canonical_name, canonical_type, mention_count |
+| `CanonicalMethod` | `canonical_id` | canonical_id, canonical_name, canonical_type, mention_count |
+| `CanonicalDataset` | `canonical_id` | canonical_id, canonical_name, canonical_type, mention_count |
+| `CanonicalMetric` | `canonical_id` | canonical_id, canonical_name, canonical_type, mention_count |
+| `CanonicalBaseline` | `canonical_id` | canonical_id, canonical_name, canonical_type, mention_count |
+| `CanonicalFlaw` | `canonical_id` | canonical_id, canonical_name, canonical_type, mention_count |
+| `CanonicalLimitation` | `canonical_id` | canonical_id, canonical_name, canonical_type, mention_count |
+
+#### 新增关系类型
+
+| 关系 | 起点 → 终点 | 说明 |
+|------|-------------|------|
+| `IS_A` | CanonicalEntity → CanonicalEntity | 层级本体（子类 → 父类） |
+| `RESOLVES_TO` | Mention → CanonicalEntity | Bronze → Gold 映射 |
+| `SAME_AS` | Mention → Mention | Silver 层等价关系 |
+
+#### canonical_type 枚举
+
+`Paradigm` | `Algorithm Family` | `Specific Algorithm` | `Metric Family` | `Specific Metric` | `Dataset Family` | `Specific Dataset` | `Task Category` | `Specific Task`
+
+### 11.5 当前图谱统计（Bronze + Silver + Gold）
+
+| 指标 | 数量 |
+|------|------|
+| **总节点** | **5,528** |
+| **总关系** | **7,435** |
+
+节点分布：
+
+| 节点类型 | 数量 |
+|----------|------|
+| Paper | 177 |
+| Section | 1,197 |
+| *Mention（Bronze） | 2,209 |
+| Canonical*（Gold） | 1,945 |
+
+关系分布：
+
+| 关系类型 | 数量 |
+|----------|------|
+| HAS_SECTION | 1,197 |
+| COMPARES_WITH_BASELINE | 593 |
+| USES_METRIC | 480 |
+| USES_DATASET | 450 |
+| PROPOSES_METHOD | 440 |
+| RESOLVES_TO | 1,853 |
+| IS_A | 1,235 |
+| ADDRESSES_FLAW | 342 |
+| HAS_LIMITATION | 205 |
+| ADDRESSES_TASK | 176 |
+| SAME_AS | 332 |
+
+### 11.6 三层查询示例
+
+```python
+from neo4j import GraphDatabase
+driver = GraphDatabase.driver("neo4j://127.0.0.1:7687", auth=("neo4j", "12345678"))
+with driver.session(database="neo4j") as session:
+    # 完整链路：论文 → Mention → 规范实体 → 父类
+    for r in session.run("""
+        MATCH (p:Paper)-[:COMPARES_WITH_BASELINE]->(m:BaselineMention)
+              -[:RESOLVES_TO]->(c:CanonicalBaseline)
+        WHERE p.paper_id = 'pan2025RobustDirect'
+        RETURN m.name AS mention, c.canonical_name AS canonical, c.canonical_type AS type
+    """):
+        print(f"  {r['mention']} → {r['canonical']} [{r['type']}]")
+
+    # 查看某规范实体的层级路径
+    for r in session.run("""
+        MATCH path = (c:CanonicalBaseline {canonical_name: 'ORB-SLAM3'})-[:IS_A*]->(parent)
+        RETURN [n IN nodes(path) | n.canonical_name] AS hierarchy
+    """):
+        print("  层级:", " → ".join(r['hierarchy']))
+
+    # 哪些论文使用了某个数据集（通过规范实体）
+    for r in session.run("""
+        MATCH (p:Paper)-[:USES_DATASET]->(m:DatasetMention)
+              -[:RESOLVES_TO]->(c:CanonicalDataset {canonical_name: 'KITTI Odometry'})
+        RETURN p.paper_id AS pid
+    """):
+        print(f"  使用 KITTI 的论文: {r['pid']}")
+driver.close()
+```
