@@ -478,8 +478,9 @@ Gold Layer（金层）  → CanonicalEntity + IS_A 层级本体
 **脚本**：`script/silver_builder.py`
 
 **规则**：
-- Rule 1：大小写/标点/空格归一化后完全相同 → 合并
-- Rule 2：别名交叉匹配（过滤泛称别名和长度 < 3 的别名） → 合并
+- Rule 1：大小写、空格、连接符、下划线归一化后完全相同 → 合并
+- aliases 不再用于直接生成正式 `SAME_AS`，避免跨论文局部简称、泛称或相关变体造成误合并。
+- `self-collected dataset`、`our own dataset` 等描述性泛称跳过自动 `SAME_AS`。
 
 **归并结果**：
 
